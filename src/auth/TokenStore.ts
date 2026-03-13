@@ -80,11 +80,13 @@ export class TokenStore {
       }
     }
 
-    // Deduplicate concurrent requests
-    const existing = this.inFlight.get(s3rn);
-    if (existing) {
-      logger.debug(`Deduplicating token request for ${s3rn}`);
-      return existing;
+    // Deduplicate concurrent requests (skip if force-refreshing to avoid returning stale in-flight tokens)
+    if (!options?.forceRefresh) {
+      const existing = this.inFlight.get(s3rn);
+      if (existing) {
+        logger.debug(`Deduplicating token request for ${s3rn}`);
+        return existing;
+      }
     }
 
     const promise = this.fetchToken(s3rn, relayId, folderId, docId).then((clientToken) => {

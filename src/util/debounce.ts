@@ -4,7 +4,7 @@
  * since the last invocation. If called again before the delay expires, the
  * timer resets.
  */
-export function debounce<T extends (...args: unknown[]) => void>(
+export function debounce<T extends (...args: any[]) => void>(
   fn: T,
   delayMs: number,
 ): (...args: Parameters<T>) => void {
@@ -25,7 +25,7 @@ export function debounce<T extends (...args: unknown[]) => void>(
  * Creates a debounced function that also exposes a `cancel()` method
  * and a `flush()` method to immediately invoke the pending call.
  */
-export function debounceCancellable<T extends (...args: unknown[]) => void>(
+export function debounceCancellable<T extends (...args: any[]) => void>(
   fn: T,
   delayMs: number,
 ): {

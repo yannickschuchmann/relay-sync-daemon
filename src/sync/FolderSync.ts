@@ -27,6 +27,7 @@ export class FolderSync {
    * Connect to the folder's Y-Sweet WebSocket.
    * Builds S3RN, fetches a ClientToken, creates the provider, sets awareness,
    * and waits for initial sync to complete.
+   * Also registers a retries-exhausted handler to automatically recover.
    */
   async connect(): Promise<void> {
     const s3rn = folderS3RN(this.config.relayGuid, this.config.folderGuid);
@@ -53,6 +54,13 @@ export class FolderSync {
       isBot: true,
     });
 
+    // Handle exhausted retries: get fresh token and reconnect
+    this.provider.on("retries-exhausted", () => {
+      this.handleRetriesExhausted().catch((err) =>
+        logger.error("Failed to recover folder connection after retries exhausted", err),
+      );
+    });
+
     // Wait for initial sync
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -68,6 +76,33 @@ export class FolderSync {
     logger.info(
       `Folder synced. ${this.filemeta.size} files in filemeta_v0`,
     );
+  }
+
+  /**
+   * Handle exhausted reconnection retries by requesting a fresh token
+   * and reconnecting the existing provider.
+   */
+  private async handleRetriesExhausted(): Promise<void> {
+    const s3rn = folderS3RN(this.config.relayGuid, this.config.folderGuid);
+    logger.info(`Requesting fresh token for folder after retries exhausted`);
+
+    try {
+      const clientToken = await this.tokenStore.getToken(
+        s3rn,
+        this.config.relayGuid,
+        this.config.folderGuid,
+        this.config.folderGuid,
+        { forceRefresh: true },
+      );
+
+      if (this.provider) {
+        this.provider.refreshToken(clientToken.url, clientToken.docId, clientToken.token);
+        this.provider.resetAndReconnect();
+        logger.info("Folder connection recovered with fresh token");
+      }
+    } catch (err) {
+      logger.error("Failed to get fresh token for folder recovery", err);
+    }
   }
 
   /**

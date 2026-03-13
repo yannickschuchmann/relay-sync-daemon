@@ -29,15 +29,22 @@ export class DocumentSync {
   }
 
   /**
+   * Build the S3RN for this document (canvas or doc).
+   */
+  private getS3RN(): string {
+    return this.meta.type === SyncType.Canvas
+      ? canvasS3RN(this.config.relayGuid, this.config.folderGuid, this.meta.id)
+      : documentS3RN(this.config.relayGuid, this.config.folderGuid, this.meta.id);
+  }
+
+  /**
    * Connect to the document's Y-Sweet WebSocket.
    * Builds S3RN based on SyncType (canvas vs doc), fetches a ClientToken,
    * creates the provider, sets awareness, and waits for initial sync.
+   * Also registers a retries-exhausted handler to automatically recover.
    */
   async connect(): Promise<void> {
-    const s3rn =
-      this.meta.type === SyncType.Canvas
-        ? canvasS3RN(this.config.relayGuid, this.config.folderGuid, this.meta.id)
-        : documentS3RN(this.config.relayGuid, this.config.folderGuid, this.meta.id);
+    const s3rn = this.getS3RN();
 
     const clientToken = await this.tokenStore.getToken(
       s3rn,
@@ -65,6 +72,13 @@ export class DocumentSync {
       isBot: true,
     });
 
+    // Handle exhausted retries: get fresh token and reconnect
+    this.provider.on("retries-exhausted", () => {
+      this.handleRetriesExhausted().catch((err) =>
+        logger.error(`Failed to recover document connection for ${this.vpath} after retries exhausted`, err),
+      );
+    });
+
     // Wait for initial sync
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -76,6 +90,33 @@ export class DocumentSync {
         resolve();
       });
     });
+  }
+
+  /**
+   * Handle exhausted reconnection retries by requesting a fresh token
+   * and reconnecting the existing provider.
+   */
+  private async handleRetriesExhausted(): Promise<void> {
+    const s3rn = this.getS3RN();
+    logger.info(`Requesting fresh token for ${this.vpath} after retries exhausted`);
+
+    try {
+      const clientToken = await this.tokenStore.getToken(
+        s3rn,
+        this.config.relayGuid,
+        this.config.folderGuid,
+        this.meta.id,
+        { forceRefresh: true },
+      );
+
+      if (this.provider) {
+        this.provider.refreshToken(clientToken.url, clientToken.docId, clientToken.token);
+        this.provider.resetAndReconnect();
+        logger.info(`Document connection recovered for ${this.vpath}`);
+      }
+    } catch (err) {
+      logger.error(`Failed to get fresh token for ${this.vpath}`, err);
+    }
   }
 
   /**

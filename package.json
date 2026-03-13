@@ -14,8 +14,7 @@
     "lib0": "^0.2.88",
     "pocketbase": "^0.26.0",
     "chokidar": "^4.0.0",
-    "diff-match-patch": "^1.0.5",
-    "jose": "^5.0.0"
+    "diff-match-patch": "^1.0.5"
   },
   "devDependencies": {
     "typescript": "^5.5.0",

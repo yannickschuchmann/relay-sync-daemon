@@ -103,6 +103,8 @@ export function getMimeTypeForExtension(ext: string): string {
     webp: "image/webp",
     bmp: "image/bmp",
     ico: "image/x-icon",
+    // Markdown
+    md: "text/markdown",
     // PDF
     pdf: "application/pdf",
     // Audio

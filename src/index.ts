@@ -30,7 +30,7 @@ async function main() {
   const tokenStore = new TokenStore(config, authManager);
 
   // Phase 2: Start SyncCoordinator and perform initial sync
-  const coordinator = new SyncCoordinator(config, tokenStore);
+  const coordinator = new SyncCoordinator(config, tokenStore, authManager);
   await coordinator.initialSync();
 
   // Start proactive token refresh loop
@@ -41,8 +41,6 @@ async function main() {
 
   // Phase 4: Setup local file watching
   coordinator.setupLocalWatching();
-
-  // TODO (Phase 5): Binary file support
 
   // Graceful shutdown
   const shutdown = async () => {

@@ -50,6 +50,8 @@ function setupWS(provider: YSweetProvider): void {
     provider.wsconnected = false;
     provider.synced = false;
 
+    logger.debug(`WebSocket connecting to ${provider.roomname}`);
+
     websocket.onmessage = (event: MessageEvent) => {
       provider.wsLastMessageReceived = time.getUnixTime();
       const encoder = readMessage(
@@ -63,10 +65,12 @@ function setupWS(provider: YSweetProvider): void {
     };
 
     websocket.onerror = (event: Event) => {
+      logger.warn(`WebSocket error for ${provider.roomname}`);
       provider.emit("connection-error", [event, provider]);
     };
 
     websocket.onclose = (event: CloseEvent) => {
+      logger.info(`WebSocket disconnected from ${provider.roomname} (code: ${event.code})`);
       provider.emit("connection-close", [event, provider]);
       provider.ws = null;
       provider.wsconnecting = false;
@@ -90,18 +94,29 @@ function setupWS(provider: YSweetProvider): void {
 
       // Exponential backoff reconnection
       if (provider.canReconnect()) {
+        const delay = math.min(
+          math.pow(2, provider.wsUnsuccessfulReconnects) * 100,
+          provider.maxBackoffTime,
+        );
+        logger.debug(
+          `Reconnecting in ${delay}ms (attempt ${provider.wsUnsuccessfulReconnects + 1}/${provider.maxConnectionErrors})`,
+        );
         setTimeout(
           setupWS,
-          math.min(
-            math.pow(2, provider.wsUnsuccessfulReconnects) * 100,
-            provider.maxBackoffTime,
-          ),
+          delay,
           provider,
         );
+      } else if (provider.shouldConnect) {
+        // Retries exhausted — emit so the coordinator can request a fresh token
+        logger.warn(
+          `Reconnection retries exhausted after ${provider.wsUnsuccessfulReconnects} attempts for ${provider.roomname}`,
+        );
+        provider.emit("retries-exhausted", [provider]);
       }
     };
 
     websocket.onopen = () => {
+      logger.info(`WebSocket connected to ${provider.roomname}`);
       provider.wsLastMessageReceived = time.getUnixTime();
       provider.wsconnecting = false;
       provider.wsconnected = true;
@@ -366,6 +381,18 @@ export class YSweetProvider extends Observable<string> {
     );
   }
 
+  /**
+   * Reset the reconnect counter and re-initiate connection.
+   * Used after obtaining a fresh token when retries were exhausted.
+   */
+  resetAndReconnect(): void {
+    this.wsUnsuccessfulReconnects = 0;
+    this.shouldConnect = true;
+    if (!this.wsconnected && this.ws === null) {
+      setupWS(this);
+    }
+  }
+
   connect(): void {
     this.shouldConnect = true;
     if (!this.wsconnected && this.ws === null) {
@@ -405,6 +432,7 @@ export class YSweetProvider extends Observable<string> {
     const urlChanged = this.url !== newUrl;
 
     if (urlChanged) {
+      logger.info(`Token refreshed for ${this.roomname}, reconnecting with new URL`);
       this.url = newUrl;
       this.wsUnsuccessfulReconnects = 0;
 
@@ -412,6 +440,8 @@ export class YSweetProvider extends Observable<string> {
       if (this.ws) {
         this.ws.close();
       }
+    } else {
+      logger.debug(`Token refreshed for ${this.roomname} (URL unchanged)`);
     }
 
     return { urlChanged, newUrl };

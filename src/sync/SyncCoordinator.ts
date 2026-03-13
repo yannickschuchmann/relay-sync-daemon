@@ -1,14 +1,26 @@
 import { readdir, unlink } from "fs/promises";
 import { join, extname } from "path";
 import type { Config } from "../config";
+import type { AuthManager } from "../auth/AuthManager";
 import type { TokenStore } from "../auth/TokenStore";
 import { FolderSync } from "./FolderSync";
 import { DocumentSync } from "./DocumentSync";
+import { BinarySync } from "./BinarySync";
 import { DiskManager } from "../fs/DiskManager";
 import { FileWatcher } from "../fs/FileWatcher";
 import { DocStore } from "../persistence/DocStore";
 import { applyTextToYDoc } from "../diff/TextDiff";
-import { type DocumentMeta, type Meta, SyncType, isTextType } from "../protocol/types";
+import {
+  type DocumentMeta,
+  type FileMetas,
+  type Meta,
+  SyncType,
+  isBinaryType,
+  isTextType,
+  getMimeTypeForExtension,
+  getSyncTypeForMimetype,
+} from "../protocol/types";
+import { folderS3RN } from "../util/s3rn";
 import { logger } from "../util/logger";
 
 /** How many documents to connect in parallel during initial sync. */
@@ -49,6 +61,7 @@ const SUPPRESSION_MS = 2000;
  */
 export class SyncCoordinator {
   private folderSync: FolderSync;
+  private binarySync: BinarySync;
   private diskManager: DiskManager;
   private docStore: DocStore;
   private connections: Map<string, DocumentSync> = new Map();
@@ -62,10 +75,11 @@ export class SyncCoordinator {
   private config: Config;
   private tokenStore: TokenStore;
 
-  constructor(config: Config, tokenStore: TokenStore) {
+  constructor(config: Config, tokenStore: TokenStore, authManager: AuthManager) {
     this.config = config;
     this.tokenStore = tokenStore;
     this.folderSync = new FolderSync(config, tokenStore);
+    this.binarySync = new BinarySync(config, authManager);
     this.diskManager = new DiskManager(config.syncDir);
     this.docStore = new DocStore(config.persistenceDir);
   }
@@ -110,6 +124,28 @@ export class SyncCoordinator {
       );
     }
 
+    // Download binary files (images, PDFs, audio, video)
+    const binaryFiles = [...files.entries()].filter(([, meta]) =>
+      isBinaryType(meta.type),
+    ) as [string, FileMetas][];
+
+    logger.info(`Syncing ${binaryFiles.length} binary files...`);
+
+    for (let i = 0; i < binaryFiles.length; i += BATCH_SIZE) {
+      const batch = binaryFiles.slice(i, i + BATCH_SIZE);
+      await Promise.all(
+        batch.map(async ([vpath, meta]) => {
+          try {
+            const content = await this.binarySync.downloadFile(vpath, meta);
+            await this.diskManager.writeBinary(vpath, content);
+            logger.info(`Downloaded binary: ${vpath} (${content.byteLength} bytes)`);
+          } catch (err) {
+            logger.error(`Failed to download binary ${vpath}:`, err);
+          }
+        }),
+      );
+    }
+
     // Start periodic persistence
     this.startPersistence();
 
@@ -148,8 +184,14 @@ export class SyncCoordinator {
           } catch (err) {
             logger.error(`Failed to sync new remote file: ${vpath}`, err);
           }
+        } else if (isBinaryType(meta.type)) {
+          logger.info(`Remote binary file added: ${vpath}`);
+          try {
+            await this.onRemoteBinaryChanged(vpath, meta as FileMetas);
+          } catch (err) {
+            logger.error(`Failed to download new remote binary: ${vpath}`, err);
+          }
         }
-        // Binary files handled in Phase 5
       },
 
       onFileDeleted: async (vpath) => {
@@ -174,7 +216,9 @@ export class SyncCoordinator {
       onFileUpdated: async (vpath, meta) => {
         try {
           logger.info(`Remote metadata updated: ${vpath}`);
-          // Handle hash changes for binary files (Phase 5)
+          if (isBinaryType(meta.type)) {
+            await this.onRemoteBinaryChanged(vpath, meta as FileMetas);
+          }
         } catch (err) {
           logger.error(`Failed to handle remote file update: ${vpath}`, err);
         }
@@ -219,18 +263,43 @@ export class SyncCoordinator {
       this.config.syncDir,
       {
         onFileChanged: (vpath) => {
-          const ext = extname(vpath).toLowerCase();
-          if (ext !== ".md" && ext !== ".canvas") return;
-          this.debouncedLocalChange(vpath);
+          const ext = extname(vpath).slice(1).toLowerCase();
+          const mimetype = getMimeTypeForExtension(ext);
+          const syncType = getSyncTypeForMimetype(mimetype);
+
+          if (isTextType(syncType)) {
+            this.debouncedLocalChange(vpath);
+          } else if (isBinaryType(syncType)) {
+            this.debouncedLocalBinaryChange(vpath);
+          }
         },
 
         onFileAdded: (vpath) => {
-          // Filter to supported file types (.md and .canvas only)
-          const ext = extname(vpath).toLowerCase();
-          if (ext !== ".md" && ext !== ".canvas") {
-            logger.warn(`Ignoring non-text file (Phase 5): ${vpath}`);
+          const ext = extname(vpath).slice(1).toLowerCase();
+          const mimetype = getMimeTypeForExtension(ext);
+          const syncType = getSyncTypeForMimetype(mimetype);
+
+          // Only handle text and binary files we know about
+          if (!isTextType(syncType) && !isBinaryType(syncType)) {
             return;
           }
+
+          // For binary files, upload if we have metadata, or create new
+          if (isBinaryType(syncType)) {
+            const meta = this.folderSync.getFilemeta().get(vpath);
+            if (meta && isBinaryType(meta.type)) {
+              // Already tracked -- treat as a change (re-upload)
+              this.debouncedLocalBinaryChange(vpath);
+            } else if (!meta) {
+              // New binary file -- create metadata and upload
+              logger.info(`Local binary file added: ${vpath}`);
+              this.createRemoteBinaryFile(vpath, mimetype, syncType)
+                .catch((err) => logger.error(`Failed to create remote binary for ${vpath}:`, err));
+            }
+            return;
+          }
+
+          // Text files: check for rename or create
 
           // Check if this is a rename (matching a recent delete)
           this.handlePossibleRenameTarget(vpath)
@@ -304,6 +373,94 @@ export class SyncCoordinator {
   }
 
   /**
+   * Debounce local binary file changes per-path.
+   * After the debounce period, reads the file and uploads if the hash has changed.
+   */
+  private debouncedLocalBinaryChange(vpath: string): void {
+    const existing = this.localChangeTimers.get(vpath);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(async () => {
+      this.localChangeTimers.delete(vpath);
+      try {
+        await this.onLocalBinaryChanged(vpath);
+      } catch (err: unknown) {
+        if (err && typeof err === "object" && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+          logger.debug(`Binary file disappeared during debounce (ENOENT), skipping: ${vpath}`);
+          return;
+        }
+        logger.error(`Failed to push local binary changes for ${vpath}:`, err);
+      }
+    }, this.config.debounceMs);
+
+    this.localChangeTimers.set(vpath, timer);
+  }
+
+  /**
+   * Handle a local binary file change: compute hash, compare with filemeta,
+   * upload if changed, and update filemeta_v0 with the new hash and synctime.
+   */
+  async onLocalBinaryChanged(vpath: string): Promise<void> {
+    const meta = this.folderSync.getFilemeta().get(vpath) as FileMetas | undefined;
+    if (!meta) {
+      logger.debug(`Local binary change ignored (no metadata): ${vpath}`);
+      return;
+    }
+
+    const content = await this.diskManager.readBinary(vpath);
+    const newHash = this.binarySync.computeSHA256(content);
+
+    if (newHash === meta.hash) {
+      logger.debug(`Binary unchanged (hash match), skipping: ${vpath}`);
+      return;
+    }
+
+    await this.binarySync.uploadFile(vpath, meta, content, newHash);
+
+    // Update filemeta with new hash and synctime
+    this.folderSync.transactFilemeta(() => {
+      this.folderSync.getFilemeta().set(vpath, {
+        ...meta,
+        hash: newHash,
+        synctime: Date.now(),
+      });
+    });
+
+    logger.info(`Uploaded binary: ${vpath}`);
+  }
+
+  /**
+   * Handle a remote binary file change (hash changed = new version available).
+   * Compares local hash with remote meta hash, downloads if different.
+   * Uses suppression to prevent watcher echo.
+   */
+  async onRemoteBinaryChanged(vpath: string, meta: FileMetas): Promise<void> {
+    // Check if local hash matches (file already up to date)
+    try {
+      const localContent = await this.diskManager.readBinary(vpath);
+      const localHash = this.binarySync.computeSHA256(localContent);
+      if (localHash === meta.hash) {
+        logger.debug(`Binary already up to date: ${vpath}`);
+        return;
+      }
+    } catch {
+      // File doesn't exist locally yet -- download it
+    }
+
+    const content = await this.binarySync.downloadFile(vpath, meta);
+    this.suppressedPaths.add(vpath);
+    await this.diskManager.writeBinary(vpath, content);
+    const existing = this.suppressionTimers.get(vpath);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.suppressedPaths.delete(vpath);
+      this.suppressionTimers.delete(vpath);
+    }, SUPPRESSION_MS);
+    this.suppressionTimers.set(vpath, timer);
+    logger.info(`Updated binary from remote: ${vpath} (${content.byteLength} bytes)`);
+  }
+
+  /**
    * Create a new document in Relay for a locally-added file.
    * Generates a UUID, adds metadata to filemeta_v0, connects a DocumentSync,
    * and sets the initial content from disk.
@@ -342,6 +499,37 @@ export class SyncCoordinator {
     );
 
     logger.info(`Created remote document: ${vpath} (${docId})`);
+  }
+
+  /**
+   * Create a new binary file in Relay for a locally-added binary file.
+   * Generates a UUID, reads the file, computes its hash, uploads it,
+   * and adds metadata to filemeta_v0.
+   */
+  async createRemoteBinaryFile(vpath: string, mimetype: string, syncType: SyncType): Promise<void> {
+    const fileId = crypto.randomUUID();
+
+    const content = await this.diskManager.readBinary(vpath);
+    const hash = this.binarySync.computeSHA256(content);
+
+    const meta: FileMetas = {
+      version: 0,
+      id: fileId,
+      type: syncType as FileMetas["type"],
+      hash,
+      mimetype,
+      synctime: Date.now(),
+    };
+
+    // Upload the file
+    await this.binarySync.uploadFile(vpath, meta, content, hash);
+
+    // Add to folder filemeta_v0 (wrapped to avoid triggering our own observer)
+    this.folderSync.transactFilemeta(() => {
+      this.folderSync.getFilemeta().set(vpath, meta);
+    });
+
+    logger.info(`Created remote binary file: ${vpath} (${fileId})`);
   }
 
   /**
@@ -565,8 +753,10 @@ export class SyncCoordinator {
               );
 
               // Refresh the folder provider if this is the folder token
+              // Use S3RN comparison instead of docId which may differ from server response
               const folderProvider = this.folderSync.getProvider();
-              if (folderProvider && entry.clientToken.docId === this.config.folderGuid) {
+              const folderS3rn = folderS3RN(this.config.relayGuid, this.config.folderGuid);
+              if (folderProvider && s3rn === folderS3rn) {
                 folderProvider.refreshToken(clientToken.url, clientToken.docId, clientToken.token);
               }
 
@@ -600,9 +790,31 @@ export class SyncCoordinator {
       this.fileWatcher = null;
     }
 
-    // Cancel all debounced local change timers
-    for (const timer of this.localChangeTimers.values()) {
+    // Flush all pending debounced local changes before shutting down
+    for (const [vpath, timer] of this.localChangeTimers) {
       clearTimeout(timer);
+      try {
+        const conn = this.connections.get(vpath);
+        if (conn) {
+          // Only apply text diff for text files; binary files are handled
+          // via upload and don't use readDocument / applyTextToYDoc.
+          const meta = this.folderSync.getFilemeta().get(vpath);
+          if (meta && isBinaryType(meta.type)) {
+            logger.debug(`Skipping text flush for binary file on shutdown: ${vpath}`);
+            continue;
+          }
+          const diskContent = await this.diskManager.readDocument(vpath);
+          applyTextToYDoc(conn.getDoc(), diskContent);
+          logger.debug(`Flushed pending local changes on shutdown: ${vpath}`);
+        }
+      } catch (err) {
+        // File may have been deleted during debounce window
+        if (err && typeof err === "object" && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+          logger.debug(`File disappeared during shutdown flush (ENOENT), skipping: ${vpath}`);
+        } else {
+          logger.error(`Failed to flush pending changes on shutdown for ${vpath}:`, err);
+        }
+      }
     }
     this.localChangeTimers.clear();
 

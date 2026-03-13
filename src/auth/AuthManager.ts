@@ -61,8 +61,14 @@ export class AuthManager {
    * Sets the auth store, validates, refreshes, and persists.
    */
   private async bootstrapFromToken(token: string): Promise<void> {
-    // Save token into PocketBase auth store (model=null for JWT-only auth)
-    this.pb.authStore.save(token, null);
+    // Save token into PocketBase auth store with a minimal record model.
+    // Some PocketBase SDK versions may not handle null correctly at runtime,
+    // so we provide a stub record with the required fields.
+    this.pb.authStore.save(token, {
+      id: "",
+      collectionId: "",
+      collectionName: "",
+    } as any);
 
     if (!this.pb.authStore.isValid) {
       throw new Error("Provided auth token is not valid (expired or malformed)");
@@ -139,12 +145,13 @@ export class AuthManager {
 
         if (this.refreshFailures >= AuthManager.MAX_REFRESH_FAILURES) {
           logger.error(
-            "Auth token refresh has failed %d consecutive times. " +
+            `Auth token refresh has failed ${AuthManager.MAX_REFRESH_FAILURES} consecutive times. ` +
               "The token has likely expired permanently (e.g., daemon was offline too long). " +
               "Please provide a fresh RELAY_TOKEN and restart the daemon.",
-            AuthManager.MAX_REFRESH_FAILURES,
           );
-          process.exit(1);
+          // Dispatch SIGTERM so the coordinator's graceful shutdown handler runs
+          // instead of terminating abruptly with process.exit(1).
+          process.kill(process.pid, "SIGTERM");
         }
       }
     }, REFRESH_INTERVAL_MS);
