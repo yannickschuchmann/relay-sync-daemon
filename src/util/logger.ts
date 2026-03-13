@@ -18,36 +18,32 @@ class Logger {
     this.level = LOG_LEVELS[level];
   }
 
-  private format(level: LogLevel, message: string, args: unknown[]): string {
+  private format(level: LogLevel, message: string): string {
     const timestamp = new Date().toISOString();
-    const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
-    if (args.length === 0) {
-      return `${prefix} ${message}`;
-    }
-    return `${prefix} ${message}`;
+    return `[${timestamp}] [${level.toUpperCase()}] ${message}`;
   }
 
   debug(message: string, ...args: unknown[]): void {
     if (this.level <= LOG_LEVELS.debug) {
-      console.debug(this.format("debug", message, args), ...args);
+      console.debug(this.format("debug", message), ...args);
     }
   }
 
   info(message: string, ...args: unknown[]): void {
     if (this.level <= LOG_LEVELS.info) {
-      console.info(this.format("info", message, args), ...args);
+      console.info(this.format("info", message), ...args);
     }
   }
 
   warn(message: string, ...args: unknown[]): void {
     if (this.level <= LOG_LEVELS.warn) {
-      console.warn(this.format("warn", message, args), ...args);
+      console.warn(this.format("warn", message), ...args);
     }
   }
 
   error(message: string, ...args: unknown[]): void {
     if (this.level <= LOG_LEVELS.error) {
-      console.error(this.format("error", message, args), ...args);
+      console.error(this.format("error", message), ...args);
     }
   }
 }

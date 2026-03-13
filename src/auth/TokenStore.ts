@@ -70,12 +70,14 @@ export class TokenStore {
    * Returns cached token if still valid, otherwise fetches a new one.
    * Deduplicates concurrent requests for the same S3RN.
    */
-  async getToken(s3rn: string, relayId: string, folderId: string, docId: string): Promise<ClientToken> {
-    // Check cache first
-    const cached = this.cache.get(s3rn);
-    if (cached && this.isValid(cached)) {
-      logger.debug(`Using cached token for ${s3rn}`);
-      return cached.clientToken;
+  async getToken(s3rn: string, relayId: string, folderId: string, docId: string, options?: { forceRefresh?: boolean }): Promise<ClientToken> {
+    // Check cache first (skip if force-refreshing)
+    if (!options?.forceRefresh) {
+      const cached = this.cache.get(s3rn);
+      if (cached && this.isValid(cached)) {
+        logger.debug(`Using cached token for ${s3rn}`);
+        return cached.clientToken;
+      }
     }
 
     // Deduplicate concurrent requests
@@ -103,7 +105,7 @@ export class TokenStore {
   /**
    * Expose all cached tokens for the refresh loop to inspect.
    */
-  getCached(): Map<string, CachedToken> {
+  getCached(): ReadonlyMap<string, CachedToken> {
     return this.cache;
   }
 }

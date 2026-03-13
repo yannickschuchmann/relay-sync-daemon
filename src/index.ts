@@ -2,6 +2,7 @@ import { loadConfig } from "./config";
 import { logger } from "./util/logger";
 import { AuthManager } from "./auth/AuthManager";
 import { TokenStore } from "./auth/TokenStore";
+import { SyncCoordinator } from "./sync/SyncCoordinator";
 
 async function main() {
   const args = process.argv.slice(2);
@@ -28,16 +29,26 @@ async function main() {
   // Phase 1: Create TokenStore
   const tokenStore = new TokenStore(config, authManager);
 
-  // TODO (Phase 2): Start SyncCoordinator and perform initial sync
-  // TODO (Phase 3): Setup remote watching
-  // TODO (Phase 4): Setup local watching
+  // Phase 2: Start SyncCoordinator and perform initial sync
+  const coordinator = new SyncCoordinator(config, tokenStore);
+  await coordinator.initialSync();
+
+  // Start proactive token refresh loop
+  coordinator.startTokenRefreshLoop();
+
+  // Phase 3: Setup remote watching
+  coordinator.setupRemoteWatching();
+
+  // Phase 4: Setup local file watching
+  coordinator.setupLocalWatching();
+
   // TODO (Phase 5): Binary file support
 
   // Graceful shutdown
   const shutdown = async () => {
     logger.info("Shutting down...");
+    await coordinator.shutdown();
     authManager.destroy();
-    // TODO: coordinator.shutdown() once SyncCoordinator is implemented
     process.exit(0);
   };
 

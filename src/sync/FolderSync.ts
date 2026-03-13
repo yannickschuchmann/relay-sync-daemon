@@ -1,5 +1,4 @@
 import * as Y from "yjs";
-import * as awarenessProtocol from "y-protocols/awareness";
 import { YSweetProvider } from "../protocol/YSweetProvider";
 import type { TokenStore } from "../auth/TokenStore";
 import type { Config } from "../config";
@@ -13,6 +12,7 @@ export class FolderSync {
   private doc: Y.Doc;
   private filemeta: Y.Map<Meta>;
   private provider: YSweetProvider | null = null;
+  private metaObserverFn: ((event: Y.YMapEvent<Meta>, transaction: Y.Transaction) => void) | null = null;
   private config: Config;
   private tokenStore: TokenStore;
 
@@ -83,6 +83,43 @@ export class FolderSync {
   }
 
   /**
+   * Observe changes to the filemeta_v0 Y.Map.
+   * Calls handlers for file additions, deletions, and metadata updates.
+   */
+  observeMetaChanges(handlers: {
+    onFileAdded: (vpath: string, meta: Meta) => void;
+    onFileDeleted: (vpath: string) => void;
+    onFileUpdated: (vpath: string, meta: Meta) => void;
+  }): void {
+    // Unobserve any existing observer before setting a new one
+    if (this.metaObserverFn) {
+      this.filemeta.unobserve(this.metaObserverFn);
+    }
+
+    this.metaObserverFn = (event, transaction) => {
+      // Skip filemeta mutations we made ourselves (create/delete/rename)
+      if (transaction.origin === "local-meta-edit") return;
+
+      event.changes.keys.forEach((change, key) => {
+        const vpath = key;
+        switch (change.action) {
+          case "add":
+            handlers.onFileAdded(vpath, this.filemeta.get(vpath)!);
+            break;
+          case "delete":
+            handlers.onFileDeleted(vpath);
+            break;
+          case "update":
+            handlers.onFileUpdated(vpath, this.filemeta.get(vpath)!);
+            break;
+        }
+      });
+    };
+
+    this.filemeta.observe(this.metaObserverFn);
+  }
+
+  /**
    * Get the Y.Doc for this folder (for external observation).
    */
   getDoc(): Y.Doc {
@@ -104,13 +141,26 @@ export class FolderSync {
   }
 
   /**
+   * Execute a callback inside a Y.Doc transaction with "local-meta-edit" origin.
+   * This prevents our own filemeta mutations from firing the observeMetaChanges handlers.
+   */
+  transactFilemeta(fn: () => void): void {
+    this.doc.transact(fn, "local-meta-edit");
+  }
+
+  /**
    * Disconnect from the folder WebSocket and clean up.
    */
   disconnect(): void {
+    if (this.metaObserverFn) {
+      this.filemeta.unobserve(this.metaObserverFn);
+      this.metaObserverFn = null;
+    }
     if (this.provider) {
       this.provider.destroy();
       this.provider = null;
     }
+    this.doc.destroy();
     logger.info("Folder disconnected");
   }
 }
