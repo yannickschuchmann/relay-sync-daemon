@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables
+.env
+!.env.example
+
+# Relay auth token
+.relay-auth
+
+# Persistence
+.relay-sync/
+*.ystate
+
+# Temp files from atomic writes
+*.tmp
+
+# Lock file
+bun.lock
