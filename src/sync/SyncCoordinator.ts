@@ -5,258 +5,184 @@ import type { AuthManager } from "../auth/AuthManager";
 import type { TokenStore } from "../auth/TokenStore";
 import { FolderSync } from "./FolderSync";
 import { DocumentSync } from "./DocumentSync";
-import { BinarySync } from "./BinarySync";
 import { DiskManager } from "../fs/DiskManager";
 import { FileWatcher } from "../fs/FileWatcher";
 import { DocStore } from "../persistence/DocStore";
-import { applyTextToYDoc } from "../diff/TextDiff";
 import {
   type DocumentMeta,
   type FileMetas,
   type Meta,
-  SyncType,
-  isBinaryType,
   isTextType,
+  isBinaryType,
   getMimeTypeForExtension,
   getSyncTypeForMimetype,
 } from "../protocol/types";
-import { folderS3RN, decodeS3RN } from "../util/s3rn";
 import { logger } from "../util/logger";
-
-/** How many documents to connect in parallel during initial sync. */
-const BATCH_SIZE = 5;
+import { captureError } from "../reporting";
+import { WriteSuppressor } from "./WriteSuppressor";
+import { TextSyncCoordinator } from "./TextSyncCoordinator";
+import { BinarySyncCoordinator } from "./BinarySyncCoordinator";
+import { TokenRefreshManager } from "./TokenRefreshManager";
 
 /** How often to persist Y.Doc state (milliseconds). */
 const PERSISTENCE_INTERVAL_MS = 30_000;
-
-/** How often to check for tokens nearing expiry (milliseconds). */
-const TOKEN_REFRESH_INTERVAL_MS = 5 * 60_000;
-
-/** Refresh tokens that expire within this window (milliseconds). */
-const TOKEN_REFRESH_WINDOW_MS = 10 * 60_000;
-
-/** Window (ms) to correlate unlink+add as a rename rather than delete+create. */
-const RENAME_WINDOW_MS = 500;
-
-/**
- * How long to suppress watcher events after a daemon-initiated write (ms).
- * Must exceed chokidar's awaitWriteFinish.stabilityThreshold (1000ms) +
- * pollInterval (100ms) plus a safety margin so that the watcher event fires
- * while the path is still suppressed.
- */
-const SUPPRESSION_MS = 2000;
 
 /**
  * Orchestrates the full sync lifecycle:
  * - Connects to the folder
  * - Discovers documents from filemeta_v0
- * - Batches document connections
- * - Writes content to disk
- * - Periodically persists Y.Doc state
- *
- * Phase 2 implements initialSync and shutdown basics.
- * Phase 3 adds remote change observation (folder meta + document text).
- * Phase 4 adds local file watching, local-to-remote push via diff-match-patch,
- * create/delete remote documents, and rename detection.
+ * - Delegates text sync to TextSyncCoordinator
+ * - Delegates binary sync to BinarySyncCoordinator
+ * - Manages token refresh via TokenRefreshManager
+ * - Sets up local and remote file watching
+ * - Handles startup and graceful shutdown
  */
 export class SyncCoordinator {
   private folderSync: FolderSync;
-  private binarySync: BinarySync;
   private diskManager: DiskManager;
   private docStore: DocStore;
-  private connections: Map<string, DocumentSync> = new Map();
-  private suppressedPaths = new Set<string>();
-  private suppressionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private suppressor: WriteSuppressor;
+  private textSync: TextSyncCoordinator;
+  private binarySync: BinarySyncCoordinator;
+  private tokenRefresh: TokenRefreshManager;
   private persistenceTimer: ReturnType<typeof setInterval> | null = null;
-  private tokenRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private fileWatcher: FileWatcher | null = null;
-  private localChangeTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private pendingDeletes = new Map<string, { meta: Meta; timer: ReturnType<typeof setTimeout> }>();
   private config: Config;
-  private tokenStore: TokenStore;
 
   constructor(config: Config, tokenStore: TokenStore, authManager: AuthManager) {
     this.config = config;
-    this.tokenStore = tokenStore;
     this.folderSync = new FolderSync(config, tokenStore);
-    this.binarySync = new BinarySync(config, authManager);
     this.diskManager = new DiskManager(config.syncDir);
     this.docStore = new DocStore(config.persistenceDir);
+    this.suppressor = new WriteSuppressor();
+
+    this.textSync = new TextSyncCoordinator(
+      config,
+      tokenStore,
+      this.folderSync,
+      this.diskManager,
+      this.docStore,
+      this.suppressor,
+    );
+
+    this.binarySync = new BinarySyncCoordinator(
+      config,
+      authManager,
+      this.folderSync,
+      this.diskManager,
+      this.suppressor,
+    );
+
+    this.tokenRefresh = new TokenRefreshManager(
+      config,
+      tokenStore,
+      this.folderSync,
+      () => this.textSync.getConnections(),
+    );
   }
 
   /**
-   * Perform initial sync:
+   * Perform initial sync with exponential backoff retry:
    * 1. Clean up orphaned .tmp files
    * 2. Connect to folder, list files
-   * 3. Filter to text types (markdown + canvas)
-   * 4. Batch-connect documents, extract content, write to disk
-   * 5. Start periodic persistence
+   * 3. Sync text documents and binary files in batches
+   * 4. Start periodic persistence
+   *
+   * Retries up to 3 times with exponential backoff (1s, 2s, 4s) for
+   * transient network errors. If all retries fail, the error propagates.
    */
   async initialSync(): Promise<void> {
-    // Clean up any orphaned .tmp files from previous interrupted runs
     await this.cleanupTmpFiles(this.config.syncDir);
-
-    // Load persisted folder Y.Doc state if available (enables incremental sync)
     await this.docStore.load(this.config.folderGuid, this.folderSync.getDoc());
 
-    // Connect to the folder and get the file list
-    await this.folderSync.connect();
+    const MAX_RETRIES = 3;
+    const BASE_DELAY_MS = 1000;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await this.folderSync.connect();
+        break; // Success
+      } catch (err) {
+        if (attempt === MAX_RETRIES) {
+          captureError(err, {
+            component: "SyncCoordinator",
+            operation: "initialSync",
+            extra: { attempt, maxRetries: MAX_RETRIES },
+          });
+          throw err;
+        }
+        const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+        logger.warn(
+          `Folder connect failed (attempt ${attempt}/${MAX_RETRIES}), retrying in ${delay}ms`,
+          err,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+
     const files = this.folderSync.listFiles();
 
-    // Filter to text-based documents (markdown and canvas)
+    // Sync text documents
     const documents = [...files.entries()].filter(([, meta]) =>
       isTextType(meta.type),
     ) as [string, DocumentMeta][];
+    await this.textSync.syncAll(documents);
 
-    logger.info(`Syncing ${documents.length} text documents...`);
-
-    // Process in batches to avoid overwhelming the server
-    for (let i = 0; i < documents.length; i += BATCH_SIZE) {
-      const batch = documents.slice(i, i + BATCH_SIZE);
-      await Promise.all(
-        batch.map(async ([vpath, meta]) => {
-          try {
-            await this.syncDocument(vpath, meta);
-          } catch (err) {
-            logger.error(`Failed to sync document: ${vpath}`, err);
-          }
-        }),
-      );
-    }
-
-    // Download binary files (images, PDFs, audio, video)
+    // Sync binary files
     const binaryFiles = [...files.entries()].filter(([, meta]) =>
       isBinaryType(meta.type),
     ) as [string, FileMetas][];
+    await this.binarySync.syncAll(binaryFiles);
 
-    logger.info(`Syncing ${binaryFiles.length} binary files...`);
-
-    for (let i = 0; i < binaryFiles.length; i += BATCH_SIZE) {
-      const batch = binaryFiles.slice(i, i + BATCH_SIZE);
-      await Promise.all(
-        batch.map(async ([vpath, meta]) => {
-          try {
-            const content = await this.binarySync.downloadFile(vpath, meta);
-            await this.diskManager.writeBinary(vpath, content);
-            logger.info(`Downloaded binary: ${vpath} (${content.byteLength} bytes)`);
-          } catch (err) {
-            logger.error(`Failed to download binary ${vpath}:`, err);
-          }
-        }),
-      );
-    }
-
-    // Start periodic persistence
     this.startPersistence();
-
     logger.info("Initial sync complete.");
   }
 
   /**
-   * Set up observation of remote changes:
-   * - Folder metadata changes (file added/deleted/updated)
-   * - Document text changes are wired up per-document in syncDocument()
+   * Set up observation of remote changes (folder metadata).
    */
   setupRemoteWatching(): void {
     this.folderSync.observeMetaChanges({
       onFileAdded: async (vpath, meta) => {
-        if (this.connections.has(vpath)) return;
-        if (isTextType(meta.type)) {
-          logger.info(`Remote file added: ${vpath}`);
-          try {
-            const docSync = new DocumentSync(
-              vpath,
-              meta as DocumentMeta,
-              this.config,
-              this.tokenStore,
-            );
-            await this.docStore.load((meta as DocumentMeta).id, docSync.getDoc());
-            await docSync.connect();
-            const content = docSync.getContent();
-            this.suppressedPaths.add(vpath);
-            await this.diskManager.writeDocument(vpath, content);
-            const existing = this.suppressionTimers.get(vpath);
-            if (existing) clearTimeout(existing);
-            const timer = setTimeout(() => { this.suppressedPaths.delete(vpath); this.suppressionTimers.delete(vpath); }, SUPPRESSION_MS);
-            this.suppressionTimers.set(vpath, timer);
-            this.connections.set(vpath, docSync);
-            docSync.observeRemoteChanges((p, c) => this.onRemoteDocChange(p, c).catch(err => logger.error(`Failed to write remote change for ${p}:`, err)));
-          } catch (err) {
-            logger.error(`Failed to sync new remote file: ${vpath}`, err);
+        try {
+          if (isTextType(meta.type)) {
+            await this.textSync.onRemoteFileAdded(vpath, meta as DocumentMeta);
+          } else if (isBinaryType(meta.type)) {
+            await this.binarySync.onRemoteFileAdded(vpath, meta as FileMetas);
           }
-        } else if (isBinaryType(meta.type)) {
-          logger.info(`Remote binary file added: ${vpath}`);
-          try {
-            await this.onRemoteBinaryChanged(vpath, meta as FileMetas);
-          } catch (err) {
-            logger.error(`Failed to download new remote binary: ${vpath}`, err);
-          }
+        } catch (err) {
+          captureError(err, { component: "SyncCoordinator", operation: "onRemoteFileAdded", vpath });
         }
       },
 
-      onFileDeleted: async (vpath) => {
+      onFileDeleted: async (vpath, meta) => {
         try {
-          logger.info(`Remote file deleted: ${vpath}`);
-          const conn = this.connections.get(vpath);
-          if (conn) {
-            conn.disconnect();
-            this.connections.delete(vpath);
+          if (isBinaryType(meta.type)) {
+            this.suppressor.suppress(vpath);
+            await this.diskManager.deleteDocument(vpath);
+            logger.info(`Remote binary file deleted: ${vpath}`);
+          } else {
+            await this.textSync.onRemoteFileDeleted(vpath);
           }
-          this.suppressedPaths.add(vpath);
-          await this.diskManager.deleteDocument(vpath);
-          const existing = this.suppressionTimers.get(vpath);
-          if (existing) clearTimeout(existing);
-          const timer = setTimeout(() => { this.suppressedPaths.delete(vpath); this.suppressionTimers.delete(vpath); }, SUPPRESSION_MS);
-          this.suppressionTimers.set(vpath, timer);
         } catch (err) {
-          logger.error(`Failed to handle remote file deletion: ${vpath}`, err);
+          captureError(err, { component: "SyncCoordinator", operation: "onRemoteFileDeleted", vpath });
         }
       },
 
       onFileUpdated: async (vpath, meta) => {
         try {
-          logger.info(`Remote metadata updated: ${vpath}`);
           if (isBinaryType(meta.type)) {
-            await this.onRemoteBinaryChanged(vpath, meta as FileMetas);
+            await this.binarySync.onRemoteBinaryChanged(vpath, meta as FileMetas);
           }
         } catch (err) {
-          logger.error(`Failed to handle remote file update: ${vpath}`, err);
+          captureError(err, { component: "SyncCoordinator", operation: "onRemoteFileUpdated", vpath });
         }
       },
     });
   }
 
   /**
-   * Handle a remote document text change: write to disk with suppression
-   * to prevent the file watcher from re-reading the file we just wrote.
-   */
-  private async onRemoteDocChange(vpath: string, content: string): Promise<void> {
-    this.suppressedPaths.add(vpath);
-    await this.diskManager.writeDocument(vpath, content);
-    // Remove suppression after a delay to let the watcher event pass
-    const existing = this.suppressionTimers.get(vpath);
-    if (existing) clearTimeout(existing);
-    const timer = setTimeout(() => { this.suppressedPaths.delete(vpath); this.suppressionTimers.delete(vpath); }, SUPPRESSION_MS);
-    this.suppressionTimers.set(vpath, timer);
-  }
-
-  /**
-   * Check if a path is currently suppressed (recently written by the daemon).
-   * Used by the file watcher to avoid echo loops.
-   */
-  isSuppressed(vpath: string): boolean {
-    return this.suppressedPaths.has(vpath);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Phase 4: Local file watching
-  // ---------------------------------------------------------------------------
-
-  /**
    * Set up file watching on the sync directory.
-   * Handles local file changes (push to Relay), new files (create remote doc),
-   * and deleted files (remove from Relay). Renames are detected by correlating
-   * unlink + add events within a short window.
    */
   setupLocalWatching(): void {
     this.fileWatcher = new FileWatcher(
@@ -268,9 +194,9 @@ export class SyncCoordinator {
           const syncType = getSyncTypeForMimetype(mimetype);
 
           if (isTextType(syncType)) {
-            this.debouncedLocalChange(vpath);
+            this.textSync.debouncedLocalChange(vpath);
           } else if (isBinaryType(syncType)) {
-            this.debouncedLocalBinaryChange(vpath);
+            this.binarySync.debouncedLocalBinaryChange(vpath);
           }
         },
 
@@ -279,370 +205,108 @@ export class SyncCoordinator {
           const mimetype = getMimeTypeForExtension(ext);
           const syncType = getSyncTypeForMimetype(mimetype);
 
-          // Only handle text and binary files we know about
-          if (!isTextType(syncType) && !isBinaryType(syncType)) {
-            return;
-          }
+          if (!isTextType(syncType) && !isBinaryType(syncType)) return;
 
-          // For binary files, upload if we have metadata, or create new
           if (isBinaryType(syncType)) {
-            const meta = this.folderSync.getFilemeta().get(vpath);
-            if (meta && isBinaryType(meta.type)) {
-              // Already tracked -- treat as a change (re-upload)
-              this.debouncedLocalBinaryChange(vpath);
-            } else if (!meta) {
-              // New binary file -- create metadata and upload
-              logger.info(`Local binary file added: ${vpath}`);
-              this.createRemoteBinaryFile(vpath, mimetype, syncType)
-                .catch((err) => logger.error(`Failed to create remote binary for ${vpath}:`, err));
-            }
+            this.binarySync.onLocalFileAdded(vpath, mimetype, syncType);
             return;
           }
 
-          // Text files: check for rename or create
-
-          // Check if this is a rename (matching a recent delete)
-          this.handlePossibleRenameTarget(vpath)
-            .then((renamedMeta) => {
-              if (renamedMeta) {
-                logger.info(`Rename detected: -> ${vpath}`);
-                return;
-              }
-
-              // New local file -> create in Relay
-              if (!this.connections.has(vpath)) {
-                logger.info(`Local file added: ${vpath}`);
-                return this.createRemoteDocument(vpath);
-              }
-            })
+          // Text file: check for rename or create
+          this.textSync
+            .onLocalFileAdded(vpath)
             .catch((err) =>
-              logger.error(`Failed to handle added file ${vpath}:`, err),
+              captureError(err, { component: "SyncCoordinator", operation: "onLocalFileAdded", vpath }),
             );
         },
 
         onFileDeleted: (vpath) => {
-          // Buffer the delete to allow rename detection
-          const conn = this.connections.get(vpath);
-          if (conn) {
-            const meta = conn.getMeta();
-            this.handlePossibleRename(vpath, meta);
-          } else {
-            // No connection -- just a local file we weren't tracking
-            logger.debug(`Local file deleted (untracked): ${vpath}`);
-          }
+          this.textSync.onLocalFileDeleted(vpath);
         },
       },
-      (vpath) => this.isSuppressed(vpath),
+      (vpath) => this.suppressor.isSuppressed(vpath),
     );
 
     this.fileWatcher.start();
   }
 
   /**
-   * Debounce local file changes per-path.
-   * Reads the file from disk and applies the diff to the Y.Doc
-   * after the debounce period (config.debounceMs, default 2s).
+   * Start the proactive token refresh loop.
    */
-  private debouncedLocalChange(vpath: string): void {
-    const existing = this.localChangeTimers.get(vpath);
-    if (existing) clearTimeout(existing);
-
-    const timer = setTimeout(async () => {
-      this.localChangeTimers.delete(vpath);
-      try {
-        const conn = this.connections.get(vpath);
-        if (!conn) {
-          logger.debug(`Local change ignored (no connection): ${vpath}`);
-          return;
-        }
-        const diskContent = await this.diskManager.readDocument(vpath);
-        applyTextToYDoc(conn.getDoc(), diskContent);
-        logger.info(`Pushed local changes to remote: ${vpath}`);
-      } catch (err: unknown) {
-        // If the file was deleted during the debounce window, the delete
-        // handler will take care of it — treat as a no-op.
-        if (err && typeof err === "object" && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
-          logger.debug(`File disappeared during debounce (ENOENT), skipping: ${vpath}`);
-          return;
-        }
-        logger.error(`Failed to push local changes for ${vpath}:`, err);
-      }
-    }, this.config.debounceMs);
-
-    this.localChangeTimers.set(vpath, timer);
+  startTokenRefreshLoop(): void {
+    this.tokenRefresh.start();
   }
 
   /**
-   * Debounce local binary file changes per-path.
-   * After the debounce period, reads the file and uploads if the hash has changed.
+   * Get the folder sync instance.
    */
-  private debouncedLocalBinaryChange(vpath: string): void {
-    const existing = this.localChangeTimers.get(vpath);
-    if (existing) clearTimeout(existing);
-
-    const timer = setTimeout(async () => {
-      this.localChangeTimers.delete(vpath);
-      try {
-        await this.onLocalBinaryChanged(vpath);
-      } catch (err: unknown) {
-        if (err && typeof err === "object" && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
-          logger.debug(`Binary file disappeared during debounce (ENOENT), skipping: ${vpath}`);
-          return;
-        }
-        logger.error(`Failed to push local binary changes for ${vpath}:`, err);
-      }
-    }, this.config.debounceMs);
-
-    this.localChangeTimers.set(vpath, timer);
+  getFolderSync(): FolderSync {
+    return this.folderSync;
   }
 
   /**
-   * Handle a local binary file change: compute hash, compare with filemeta,
-   * upload if changed, and update filemeta_v0 with the new hash and synctime.
+   * Get the disk manager.
    */
-  async onLocalBinaryChanged(vpath: string): Promise<void> {
-    const meta = this.folderSync.getFilemeta().get(vpath) as FileMetas | undefined;
-    if (!meta) {
-      logger.debug(`Local binary change ignored (no metadata): ${vpath}`);
-      return;
+  getDiskManager(): DiskManager {
+    return this.diskManager;
+  }
+
+  /**
+   * Get all active document connections.
+   */
+  getConnections(): ReadonlyMap<string, DocumentSync> {
+    return this.textSync.getConnections();
+  }
+
+  /**
+   * Graceful shutdown: persist all state, disconnect everything.
+   */
+  async shutdown(): Promise<void> {
+    logger.info("SyncCoordinator shutting down...");
+
+    // Stop file watcher
+    if (this.fileWatcher) {
+      await this.fileWatcher.stop();
+      this.fileWatcher = null;
     }
 
-    const content = await this.diskManager.readBinary(vpath);
-    const newHash = this.binarySync.computeSHA256(content);
-
-    if (newHash === meta.hash) {
-      logger.debug(`Binary unchanged (hash match), skipping: ${vpath}`);
-      return;
+    // Stop periodic persistence
+    if (this.persistenceTimer) {
+      clearInterval(this.persistenceTimer);
+      this.persistenceTimer = null;
     }
 
-    await this.binarySync.uploadFile(vpath, meta, content, newHash);
+    // Flush pending text changes and renames (connections still open)
+    await this.textSync.flushAndDisconnect();
 
-    // Update filemeta with new hash and synctime
-    this.folderSync.transactFilemeta(() => {
-      this.folderSync.getFilemeta().set(vpath, {
-        ...meta,
-        hash: newHash,
-        synctime: Date.now(),
-      });
-    });
-
-    logger.info(`Uploaded binary: ${vpath}`);
-  }
-
-  /**
-   * Handle a remote binary file change (hash changed = new version available).
-   * Compares local hash with remote meta hash, downloads if different.
-   * Uses suppression to prevent watcher echo.
-   */
-  async onRemoteBinaryChanged(vpath: string, meta: FileMetas): Promise<void> {
-    // Check if local hash matches (file already up to date)
+    // Persist all Y.Doc state BEFORE disconnecting documents
     try {
-      const localContent = await this.diskManager.readBinary(vpath);
-      const localHash = this.binarySync.computeSHA256(localContent);
-      if (localHash === meta.hash) {
-        logger.debug(`Binary already up to date: ${vpath}`);
-        return;
-      }
-    } catch {
-      // File doesn't exist locally yet -- download it
+      await this.persistAll();
+    } catch (err) {
+      captureError(err, { component: "SyncCoordinator", operation: "shutdown-persist" });
     }
 
-    const content = await this.binarySync.downloadFile(vpath, meta);
-    this.suppressedPaths.add(vpath);
-    await this.diskManager.writeBinary(vpath, content);
-    const existing = this.suppressionTimers.get(vpath);
-    if (existing) clearTimeout(existing);
-    const timer = setTimeout(() => {
-      this.suppressedPaths.delete(vpath);
-      this.suppressionTimers.delete(vpath);
-    }, SUPPRESSION_MS);
-    this.suppressionTimers.set(vpath, timer);
-    logger.info(`Updated binary from remote: ${vpath} (${content.byteLength} bytes)`);
-  }
+    // Clear binary debounce timers
+    this.binarySync.clearTimers();
 
-  /**
-   * Create a new document in Relay for a locally-added file.
-   * Generates a UUID, adds metadata to filemeta_v0, connects a DocumentSync,
-   * and sets the initial content from disk.
-   */
-  async createRemoteDocument(vpath: string): Promise<void> {
-    const docId = crypto.randomUUID();
+    // Stop token refresh loop
+    this.tokenRefresh.stop();
 
-    // Determine sync type from extension
-    const ext = extname(vpath).slice(1).toLowerCase();
-    const type = ext === "canvas" ? SyncType.Canvas : SyncType.Document;
+    // Clear suppression state
+    this.suppressor.clear();
 
-    const meta: DocumentMeta = {
-      version: 0,
-      id: docId,
-      type,
-    };
+    // Disconnect folder
+    this.folderSync.disconnect();
 
-    // Add to folder filemeta_v0 (wrapped to avoid triggering our own observer)
-    this.folderSync.transactFilemeta(() => {
-      this.folderSync.getFilemeta().set(vpath, meta);
-    });
-
-    // Connect to the new document
-    const docSync = new DocumentSync(vpath, meta, this.config, this.tokenStore);
-    await docSync.connect();
-
-    // Read disk content and apply to Y.Doc
-    const diskContent = await this.diskManager.readDocument(vpath);
-    applyTextToYDoc(docSync.getDoc(), diskContent);
-
-    this.connections.set(vpath, docSync);
-    docSync.observeRemoteChanges((p, c) =>
-      this.onRemoteDocChange(p, c).catch((err) =>
-        logger.error(`Failed to write remote change for ${p}:`, err),
-      ),
-    );
-
-    logger.info(`Created remote document: ${vpath} (${docId})`);
-  }
-
-  /**
-   * Create a new binary file in Relay for a locally-added binary file.
-   * Generates a UUID, reads the file, computes its hash, uploads it,
-   * and adds metadata to filemeta_v0.
-   */
-  async createRemoteBinaryFile(vpath: string, mimetype: string, syncType: SyncType): Promise<void> {
-    const fileId = crypto.randomUUID();
-
-    const content = await this.diskManager.readBinary(vpath);
-    const hash = this.binarySync.computeSHA256(content);
-
-    const meta: FileMetas = {
-      version: 0,
-      id: fileId,
-      type: syncType as FileMetas["type"],
-      hash,
-      mimetype,
-      synctime: Date.now(),
-    };
-
-    // Upload the file
-    await this.binarySync.uploadFile(vpath, meta, content, hash);
-
-    // Add to folder filemeta_v0 (wrapped to avoid triggering our own observer)
-    this.folderSync.transactFilemeta(() => {
-      this.folderSync.getFilemeta().set(vpath, meta);
-    });
-
-    logger.info(`Created remote binary file: ${vpath} (${fileId})`);
-  }
-
-  /**
-   * Remove a document from Relay when a local file is deleted.
-   * Disconnects the DocumentSync and removes the entry from filemeta_v0.
-   */
-  async deleteRemoteDocument(vpath: string): Promise<void> {
-    const conn = this.connections.get(vpath);
-    if (conn) {
-      conn.disconnect();
-      this.connections.delete(vpath);
-    }
-
-    // Remove from folder metadata (wrapped to avoid triggering our own observer)
-    this.folderSync.transactFilemeta(() => {
-      this.folderSync.getFilemeta().delete(vpath);
-    });
-
-    logger.info(`Deleted remote document: ${vpath}`);
+    logger.info("SyncCoordinator shutdown complete.");
   }
 
   // ---------------------------------------------------------------------------
-  // Rename Detection
+  // Private helpers
   // ---------------------------------------------------------------------------
 
   /**
-   * Buffer a file deletion to allow rename detection.
-   * If no matching add arrives within RENAME_WINDOW_MS, the delete is treated
-   * as a real deletion.
-   */
-  private handlePossibleRename(deletedVpath: string, meta: Meta): void {
-    logger.debug(`Buffering delete for rename detection: ${deletedVpath}`);
-
-    const timer = setTimeout(() => {
-      // No matching add arrived -- treat as a real delete
-      this.pendingDeletes.delete(deletedVpath);
-      logger.info(`Local file deleted (confirmed): ${deletedVpath}`);
-      this.deleteRemoteDocument(deletedVpath).catch((err) =>
-        logger.error(`Failed to delete remote document for ${deletedVpath}:`, err),
-      );
-    }, RENAME_WINDOW_MS);
-
-    this.pendingDeletes.set(deletedVpath, { meta, timer });
-  }
-
-  /**
-   * Check if a newly-added file matches a pending delete (rename detection).
-   * Compares the new file's content against the old document's Y.Text content
-   * to avoid false-positive matches. If a match is found, updates filemeta_v0
-   * and the connections map to reflect the rename.
-   * Returns the matched meta if a rename was detected, or null otherwise.
-   */
-  private async handlePossibleRenameTarget(addedVpath: string): Promise<Meta | null> {
-    let newContent: string;
-    try {
-      newContent = await this.diskManager.readDocument(addedVpath);
-    } catch {
-      return null;
-    }
-
-    // Look for a pending delete whose content matches the new file
-    for (const [oldVpath, pending] of this.pendingDeletes) {
-      const conn = this.connections.get(oldVpath);
-      if (!conn) continue;
-
-      const oldContent = conn.getContent();
-      if (oldContent !== newContent) continue;
-
-      // Content matches — this is a rename
-      clearTimeout(pending.timer);
-      this.pendingDeletes.delete(oldVpath);
-
-      // Update filemeta atomically: remove old path, set new path with same docId
-      this.folderSync.transactFilemeta(() => {
-        const filemeta = this.folderSync.getFilemeta();
-        filemeta.delete(oldVpath);
-        filemeta.set(addedVpath, pending.meta);
-      });
-
-      // Update internal connection map
-      conn.setVpath(addedVpath);
-      this.connections.delete(oldVpath);
-      this.connections.set(addedVpath, conn);
-
-      logger.info(`Rename detected: ${oldVpath} -> ${addedVpath}`);
-      return pending.meta;
-    }
-
-    return null;
-  }
-
-  /**
-   * Connect to a single document, get its content, and write to disk.
-   */
-  private async syncDocument(
-    vpath: string,
-    meta: DocumentMeta,
-  ): Promise<void> {
-    const docSync = new DocumentSync(vpath, meta, this.config, this.tokenStore);
-
-    // Load persisted Y.Doc state if available (enables incremental sync)
-    await this.docStore.load(meta.id, docSync.getDoc());
-
-    await docSync.connect();
-    const content = docSync.getContent();
-    await this.diskManager.writeDocument(vpath, content);
-    this.connections.set(vpath, docSync);
-    docSync.observeRemoteChanges((p, c) => this.onRemoteDocChange(p, c).catch(err => logger.error(`Failed to write remote change for ${p}:`, err)));
-    logger.info(`Synced: ${vpath} (${content.length} chars)`);
-  }
-
-  /**
-   * Start periodic Y.Doc state persistence (every 30s).
+   * Start periodic Y.Doc state persistence.
    */
   private startPersistence(): void {
     if (this.persistenceTimer) {
@@ -653,34 +317,23 @@ export class SyncCoordinator {
       try {
         await this.persistAll();
       } catch (err) {
-        logger.error("Periodic persistence failed", err);
+        captureError(err, { component: "SyncCoordinator", operation: "periodicPersistence" });
       }
     }, PERSISTENCE_INTERVAL_MS);
   }
 
   /**
-   * Persist all connected Y.Doc states to disk.
+   * Persist all Y.Doc states (documents + folder).
    */
   private async persistAll(): Promise<void> {
-    const entries = [...this.connections.entries()];
+    await this.textSync.persistAll();
 
-    const results = await Promise.allSettled([
-      // Persist all document Y.Docs
-      ...entries.map(([, docSync]) =>
-        this.docStore.save(docSync.getMeta().id, docSync.getDoc()),
-      ),
-      // Also persist the folder doc
-      this.docStore.save(this.config.folderGuid, this.folderSync.getDoc()),
-    ]);
-
-    for (const result of results) {
-      if (result.status === "rejected") {
-        logger.error("Failed to persist Y.Doc state", result.reason);
-      }
+    // Also persist the folder doc
+    try {
+      await this.docStore.save(this.config.folderGuid, this.folderSync.getDoc());
+    } catch (err) {
+      captureError(err, { component: "SyncCoordinator", operation: "persistFolderDoc" });
     }
-
-    const saved = results.filter((r) => r.status === "fulfilled").length;
-    logger.debug(`Persisted ${saved} Y.Doc states`);
   }
 
   /**
@@ -692,7 +345,6 @@ export class SyncCoordinator {
       for (const entry of entries) {
         const fullPath = join(dir, entry.name);
         if (entry.isDirectory()) {
-          // Skip the persistence directory
           if (fullPath === this.config.persistenceDir) continue;
           await this.cleanupTmpFiles(fullPath);
         } else if (entry.name.endsWith(".tmp")) {
@@ -703,189 +355,5 @@ export class SyncCoordinator {
     } catch {
       // Directory might not exist yet on first run
     }
-  }
-
-  /**
-   * Get the folder sync instance (for external observation in later phases).
-   */
-  getFolderSync(): FolderSync {
-    return this.folderSync;
-  }
-
-  /**
-   * Get the disk manager (for external use in later phases).
-   */
-  getDiskManager(): DiskManager {
-    return this.diskManager;
-  }
-
-  /**
-   * Get all active document connections.
-   */
-  getConnections(): ReadonlyMap<string, DocumentSync> {
-    return this.connections;
-  }
-
-  /**
-   * Start a periodic loop that checks for tokens nearing expiry
-   * (within 10 minutes) and refreshes them proactively.
-   */
-  startTokenRefreshLoop(): void {
-    if (this.tokenRefreshTimer) {
-      clearInterval(this.tokenRefreshTimer);
-    }
-
-    this.tokenRefreshTimer = setInterval(async () => {
-      try {
-        const cached = this.tokenStore.getCached();
-        const now = Date.now();
-
-        for (const [s3rn, entry] of cached) {
-          if (entry.expiryTime - now < TOKEN_REFRESH_WINDOW_MS) {
-            logger.info(`Refreshing token for ${s3rn}`);
-            try {
-              // Extract the original docId from the S3RN key (like the Obsidian plugin does),
-              // rather than using entry.clientToken.docId which may differ from the original.
-              const resource = decodeS3RN(s3rn);
-              let docId: string;
-              switch (resource.kind) {
-                case "folder":
-                  docId = resource.folderId;
-                  break;
-                case "doc":
-                  docId = resource.documentId;
-                  break;
-                case "canvas":
-                  docId = resource.canvasId;
-                  break;
-                case "file":
-                  docId = resource.fileId;
-                  break;
-                default:
-                  logger.debug(`Skipping token refresh for unsupported S3RN kind: ${s3rn}`);
-                  continue;
-              }
-
-              const clientToken = await this.tokenStore.getToken(
-                s3rn,
-                this.config.relayGuid,
-                this.config.folderGuid,
-                docId,
-                { forceRefresh: true },
-              );
-
-              // Refresh the folder provider if this is the folder token
-              const folderProvider = this.folderSync.getProvider();
-              const folderS3rn = folderS3RN(this.config.relayGuid, this.config.folderGuid);
-              if (folderProvider && s3rn === folderS3rn) {
-                folderProvider.refreshToken(clientToken.url, clientToken.docId, clientToken.token);
-              }
-
-              // Refresh document providers
-              for (const [, docSync] of this.connections) {
-                const provider = docSync.getProvider();
-                if (provider && docSync.getMeta().id === docId) {
-                  provider.refreshToken(clientToken.url, clientToken.docId, clientToken.token);
-                }
-              }
-            } catch (err) {
-              logger.error(`Failed to refresh token for ${s3rn}`, err);
-            }
-          }
-        }
-      } catch (err) {
-        logger.error("Token refresh loop failed", err);
-      }
-    }, TOKEN_REFRESH_INTERVAL_MS);
-  }
-
-  /**
-   * Graceful shutdown: persist all state, disconnect all documents, disconnect folder.
-   */
-  async shutdown(): Promise<void> {
-    logger.info("SyncCoordinator shutting down...");
-
-    // Stop file watcher
-    if (this.fileWatcher) {
-      await this.fileWatcher.stop();
-      this.fileWatcher = null;
-    }
-
-    // Flush all pending debounced local changes before shutting down
-    for (const [vpath, timer] of this.localChangeTimers) {
-      clearTimeout(timer);
-      try {
-        const conn = this.connections.get(vpath);
-        if (conn) {
-          // Only apply text diff for text files; binary files are handled
-          // via upload and don't use readDocument / applyTextToYDoc.
-          const meta = this.folderSync.getFilemeta().get(vpath);
-          if (meta && isBinaryType(meta.type)) {
-            logger.debug(`Skipping text flush for binary file on shutdown: ${vpath}`);
-            continue;
-          }
-          const diskContent = await this.diskManager.readDocument(vpath);
-          applyTextToYDoc(conn.getDoc(), diskContent);
-          logger.debug(`Flushed pending local changes on shutdown: ${vpath}`);
-        }
-      } catch (err) {
-        // File may have been deleted during debounce window
-        if (err && typeof err === "object" && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
-          logger.debug(`File disappeared during shutdown flush (ENOENT), skipping: ${vpath}`);
-        } else {
-          logger.error(`Failed to flush pending changes on shutdown for ${vpath}:`, err);
-        }
-      }
-    }
-    this.localChangeTimers.clear();
-
-    // Execute all pending deletes (don't wait for rename window to expire)
-    for (const [vpath, pending] of this.pendingDeletes) {
-      clearTimeout(pending.timer);
-      try {
-        await this.deleteRemoteDocument(vpath);
-      } catch (err) {
-        logger.error(`Failed to delete pending document on shutdown: ${vpath}`, err);
-      }
-    }
-    this.pendingDeletes.clear();
-
-    // Stop periodic persistence
-    if (this.persistenceTimer) {
-      clearInterval(this.persistenceTimer);
-      this.persistenceTimer = null;
-    }
-
-    // Stop token refresh loop
-    if (this.tokenRefreshTimer) {
-      clearInterval(this.tokenRefreshTimer);
-      this.tokenRefreshTimer = null;
-    }
-
-    // Clear all suppression timers
-    for (const timer of this.suppressionTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.suppressionTimers.clear();
-    this.suppressedPaths.clear();
-
-    // Final persistence save
-    try {
-      await this.persistAll();
-    } catch (err) {
-      logger.error("Failed to persist state during shutdown", err);
-    }
-
-    // Disconnect all document connections
-    for (const [vpath, docSync] of this.connections) {
-      logger.debug(`Disconnecting document: ${vpath}`);
-      docSync.disconnect();
-    }
-    this.connections.clear();
-
-    // Disconnect folder
-    this.folderSync.disconnect();
-
-    logger.info("SyncCoordinator shutdown complete.");
   }
 }
