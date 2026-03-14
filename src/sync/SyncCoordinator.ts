@@ -20,7 +20,7 @@ import {
   getMimeTypeForExtension,
   getSyncTypeForMimetype,
 } from "../protocol/types";
-import { folderS3RN } from "../util/s3rn";
+import { folderS3RN, decodeS3RN } from "../util/s3rn";
 import { logger } from "../util/logger";
 
 /** How many documents to connect in parallel during initial sync. */
@@ -357,7 +357,7 @@ export class SyncCoordinator {
         }
         const diskContent = await this.diskManager.readDocument(vpath);
         applyTextToYDoc(conn.getDoc(), diskContent);
-        logger.debug(`Pushed local changes to remote: ${vpath}`);
+        logger.info(`Pushed local changes to remote: ${vpath}`);
       } catch (err: unknown) {
         // If the file was deleted during the debounce window, the delete
         // handler will take care of it — treat as a no-op.
@@ -744,16 +744,37 @@ export class SyncCoordinator {
           if (entry.expiryTime - now < TOKEN_REFRESH_WINDOW_MS) {
             logger.info(`Refreshing token for ${s3rn}`);
             try {
+              // Extract the original docId from the S3RN key (like the Obsidian plugin does),
+              // rather than using entry.clientToken.docId which may differ from the original.
+              const resource = decodeS3RN(s3rn);
+              let docId: string;
+              switch (resource.kind) {
+                case "folder":
+                  docId = resource.folderId;
+                  break;
+                case "doc":
+                  docId = resource.documentId;
+                  break;
+                case "canvas":
+                  docId = resource.canvasId;
+                  break;
+                case "file":
+                  docId = resource.fileId;
+                  break;
+                default:
+                  logger.debug(`Skipping token refresh for unsupported S3RN kind: ${s3rn}`);
+                  continue;
+              }
+
               const clientToken = await this.tokenStore.getToken(
                 s3rn,
                 this.config.relayGuid,
                 this.config.folderGuid,
-                entry.clientToken.docId,
+                docId,
                 { forceRefresh: true },
               );
 
               // Refresh the folder provider if this is the folder token
-              // Use S3RN comparison instead of docId which may differ from server response
               const folderProvider = this.folderSync.getProvider();
               const folderS3rn = folderS3RN(this.config.relayGuid, this.config.folderGuid);
               if (folderProvider && s3rn === folderS3rn) {
@@ -763,7 +784,7 @@ export class SyncCoordinator {
               // Refresh document providers
               for (const [, docSync] of this.connections) {
                 const provider = docSync.getProvider();
-                if (provider && docSync.getMeta().id === entry.clientToken.docId) {
+                if (provider && docSync.getMeta().id === docId) {
                   provider.refreshToken(clientToken.url, clientToken.docId, clientToken.token);
                 }
               }

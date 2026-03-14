@@ -48,17 +48,17 @@ export class FileWatcher {
 
     this.watcher
       .on("change", (absPath: string) => {
-        const vpath = relative(this.syncDir, absPath);
+        const vpath = "/" + relative(this.syncDir, absPath);
         if (this.isSuppressed(vpath)) return;
         this.handlers.onFileChanged(vpath);
       })
       .on("add", (absPath: string) => {
-        const vpath = relative(this.syncDir, absPath);
+        const vpath = "/" + relative(this.syncDir, absPath);
         if (this.isSuppressed(vpath)) return;
         this.handlers.onFileAdded(vpath);
       })
       .on("unlink", (absPath: string) => {
-        const vpath = relative(this.syncDir, absPath);
+        const vpath = "/" + relative(this.syncDir, absPath);
         if (this.isSuppressed(vpath)) return;
         this.handlers.onFileDeleted(vpath);
       })
