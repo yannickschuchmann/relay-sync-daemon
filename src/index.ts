@@ -1,8 +1,32 @@
 import { loadConfig } from "./config";
 import { logger } from "./util/logger";
+import { LockFile } from "./util/LockFile";
 import { AuthManager } from "./auth/AuthManager";
 import { TokenStore } from "./auth/TokenStore";
 import { SyncCoordinator } from "./sync/SyncCoordinator";
+import {
+  setErrorReporter,
+  getErrorReporter,
+  captureError,
+  captureMessage,
+  ConsoleReporter,
+  CompositeReporter,
+  SentryReporter,
+} from "./reporting";
+import type { ErrorReporter } from "./reporting";
+
+let lockFile: LockFile | null = null;
+
+async function initReporter(): Promise<ErrorReporter> {
+  const mode = process.env.ERROR_REPORTER;
+  if (mode === "sentry") {
+    const sentry = new SentryReporter();
+    const composite = new CompositeReporter([new ConsoleReporter(), sentry]);
+    await composite.init();
+    return composite;
+  }
+  return new ConsoleReporter();
+}
 
 async function main() {
   const args = process.argv.slice(2);
@@ -15,7 +39,16 @@ async function main() {
     process.exit(0);
   }
 
+  // Initialize error reporter early
+  const reporter = await initReporter();
+  setErrorReporter(reporter);
+
   const config = loadConfig();
+
+  // Acquire lock in persistenceDir to avoid triggering sync events
+  lockFile = new LockFile(config.persistenceDir);
+  lockFile.acquire();
+
   logger.info("Starting Relay Sync Daemon");
   logger.info(`Relay: ${config.relayGuid}`);
   logger.info(`Folder: ${config.folderGuid}`);
@@ -45,8 +78,18 @@ async function main() {
   // Graceful shutdown
   const shutdown = async () => {
     logger.info("Shutting down...");
+
+    // Force exit if shutdown hangs
+    const forceExitTimer = setTimeout(() => {
+      captureMessage("Shutdown timed out after 10s, forcing exit", "error", { component: "main", operation: "shutdown" });
+      process.exit(1);
+    }, 10_000);
+    forceExitTimer.unref();
+
     await coordinator.shutdown();
     authManager.destroy();
+    lockFile?.release();
+    await getErrorReporter().flush?.();
     process.exit(0);
   };
 
@@ -56,7 +99,15 @@ async function main() {
   logger.info("Daemon running. Press Ctrl+C to stop.");
 }
 
-main().catch((err) => {
-  logger.error("Fatal error:", err);
+main().catch(async (err) => {
+  captureError(err, { component: "main", operation: "startup" });
+  // Release lock on fatal error (best-effort; stale-lock check on next
+  // startup will handle it if this fails).
+  try {
+    lockFile?.release();
+  } catch {
+    // Best-effort
+  }
+  await getErrorReporter().flush?.();
   process.exit(1);
 });
