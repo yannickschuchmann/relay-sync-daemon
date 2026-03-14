@@ -14,10 +14,6 @@ class Logger {
     this.level = LOG_LEVELS[level];
   }
 
-  setLevel(level: LogLevel): void {
-    this.level = LOG_LEVELS[level];
-  }
-
   private format(level: LogLevel, message: string): string {
     const timestamp = new Date().toISOString();
     return `[${timestamp}] [${level.toUpperCase()}] ${message}`;
@@ -48,7 +44,13 @@ class Logger {
   }
 }
 
-const envLevel = (process.env.LOG_LEVEL ?? "info").toLowerCase() as LogLevel;
-const validLevel = envLevel in LOG_LEVELS ? envLevel : "info";
+const envLevel = (process.env.LOG_LEVEL ?? "info").toLowerCase();
+const validLevel = envLevel in LOG_LEVELS ? (envLevel as LogLevel) : "info";
+
+if (process.env.LOG_LEVEL && !(envLevel in LOG_LEVELS)) {
+  console.warn(
+    `[relay-sync-daemon] Invalid LOG_LEVEL "${process.env.LOG_LEVEL}". Valid levels: ${Object.keys(LOG_LEVELS).join(", ")}. Falling back to "info".`,
+  );
+}
 
 export const logger = new Logger(validLevel);

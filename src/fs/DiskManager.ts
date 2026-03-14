@@ -65,12 +65,18 @@ export class DiskManager {
    * Throws if the resolved path escapes the sync directory (path traversal protection).
    */
   toAbsolute(vpath: string): string {
+    if (!vpath || vpath === "/" || vpath === ".") {
+      throw new Error(`Invalid vpath: "${vpath}"`);
+    }
     // Strip leading slash so resolve() treats it as relative to syncDir
     const sanitized = vpath.replace(/^\/+/, "");
     const resolved = resolve(this.syncDir, sanitized);
     const normalizedSyncDir = resolve(this.syncDir);
     if (!resolved.startsWith(normalizedSyncDir + "/") && resolved !== normalizedSyncDir) {
       throw new Error(`Path traversal detected: "${vpath}" resolves outside sync directory`);
+    }
+    if (resolved === normalizedSyncDir) {
+      throw new Error(`Invalid vpath: "${vpath}" resolves to sync directory root`);
     }
     return resolved;
   }
