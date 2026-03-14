@@ -20,3 +20,5 @@ dist/
 
 # Lock file
 bun.lock
+
+.claude/worktrees
