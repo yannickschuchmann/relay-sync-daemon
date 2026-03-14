@@ -2,6 +2,7 @@ import PocketBase from "pocketbase";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import { logger } from "../util/logger";
+import { captureError, captureMessage } from "../reporting";
 import type { Config } from "../config";
 
 const AUTH_FILE = ".relay-auth";
@@ -48,12 +49,8 @@ export class AuthManager {
    */
   private persistToken(): void {
     const filePath = join(this.config.persistenceDir, AUTH_FILE);
-    try {
-      writeFileSync(filePath, this.pb.authStore.token, "utf-8");
-      logger.debug("Persisted auth token to disk");
-    } catch (err) {
-      logger.warn("Failed to persist auth token", err);
-    }
+    writeFileSync(filePath, this.pb.authStore.token, "utf-8");
+    logger.debug("Persisted auth token to disk");
   }
 
   /**
@@ -133,21 +130,24 @@ export class AuthManager {
     this.refreshTimer = setInterval(async () => {
       try {
         await this.pb.collection("users").authRefresh();
-        this.refreshFailures = 0;
         this.persistToken();
+        this.refreshFailures = 0;
         logger.info("Auth token refreshed on schedule");
       } catch (err) {
         this.refreshFailures++;
-        logger.error(
-          `Scheduled auth token refresh failed (${this.refreshFailures}/${AuthManager.MAX_REFRESH_FAILURES})`,
-          err,
-        );
+        captureError(err, {
+          component: "AuthManager",
+          operation: "scheduledRefresh",
+          extra: { attempt: this.refreshFailures, maxFailures: AuthManager.MAX_REFRESH_FAILURES },
+        });
 
         if (this.refreshFailures >= AuthManager.MAX_REFRESH_FAILURES) {
-          logger.error(
+          captureMessage(
             `Auth token refresh has failed ${AuthManager.MAX_REFRESH_FAILURES} consecutive times. ` +
               "The token has likely expired permanently (e.g., daemon was offline too long). " +
               "Please provide a fresh RELAY_TOKEN and restart the daemon.",
+            "error",
+            { component: "AuthManager", operation: "scheduledRefresh" },
           );
           // Dispatch SIGTERM so the coordinator's graceful shutdown handler runs
           // instead of terminating abruptly with process.exit(1).

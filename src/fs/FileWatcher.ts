@@ -1,6 +1,7 @@
 import { watch, type FSWatcher as ChokidarWatcher } from "chokidar";
 import { relative } from "path";
 import { logger } from "../util/logger";
+import { captureError } from "../reporting";
 
 export interface FileWatcherHandlers {
   onFileChanged: (vpath: string) => void;
@@ -63,7 +64,7 @@ export class FileWatcher {
         this.handlers.onFileDeleted(vpath);
       })
       .on("error", (err: unknown) => {
-        logger.error("File watcher error:", err);
+        captureError(err, { component: "FileWatcher", operation: "watch" });
       })
       .on("ready", () => {
         logger.info("File watcher ready");

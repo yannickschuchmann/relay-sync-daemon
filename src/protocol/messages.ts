@@ -9,6 +9,7 @@ import * as authProtocol from "y-protocols/auth";
 import * as awarenessProtocol from "y-protocols/awareness";
 import type { YSweetProvider } from "./YSweetProvider";
 import { logger } from "../util/logger";
+import { captureMessage } from "../reporting";
 
 /** Message type constants */
 export const messageSync = 0;
@@ -95,7 +96,11 @@ export function readMessage(
   if (messageHandler) {
     messageHandler(encoder, decoder, provider, emitSynced, messageType);
   } else {
-    logger.error(`Unable to compute message of type ${messageType}`);
+    captureMessage(
+      `Unable to compute message of type ${messageType}`,
+      "error",
+      { component: "YSweetProvider", operation: "readMessage" },
+    );
   }
   return encoder;
 }

@@ -24,6 +24,7 @@ import {
   type MessageHandler,
 } from "./messages";
 import { logger } from "../util/logger";
+import { captureError } from "../reporting";
 
 /** Timeout for considering a connection dead (no messages received). */
 const MESSAGE_RECONNECT_TIMEOUT = 30000;
@@ -54,13 +55,20 @@ function setupWS(provider: YSweetProvider): void {
 
     websocket.onmessage = (event: MessageEvent) => {
       provider.wsLastMessageReceived = time.getUnixTime();
-      const encoder = readMessage(
-        provider,
-        new Uint8Array(event.data as ArrayBuffer),
-        true,
-      );
-      if (encoding.length(encoder) > 1) {
-        websocket.send(encoding.toUint8Array(encoder));
+      try {
+        const encoder = readMessage(
+          provider,
+          new Uint8Array(event.data as ArrayBuffer),
+          true,
+        );
+        if (encoding.length(encoder) > 1) {
+          websocket.send(encoding.toUint8Array(encoder));
+        }
+      } catch (err) {
+        captureError(err, { component: "YSweetProvider", operation: "onMessage", extra: { roomname: provider.roomname } });
+        provider.emit("connection-error", [err, provider]);
+        // Close and let the reconnection logic handle recovery
+        websocket.close();
       }
     };
 

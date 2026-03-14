@@ -5,6 +5,7 @@ import type { Config } from "../config";
 import type { Meta } from "../protocol/types";
 import { folderS3RN } from "../util/s3rn";
 import { logger } from "../util/logger";
+import { captureError } from "../reporting";
 
 const FILEMETA_MAP = "filemeta_v0";
 
@@ -57,14 +58,28 @@ export class FolderSync {
     // Handle exhausted retries: get fresh token and reconnect
     this.provider.on("retries-exhausted", () => {
       this.handleRetriesExhausted().catch((err) =>
-        logger.error("Failed to recover folder connection after retries exhausted", err),
+        captureError(err, { component: "FolderSync", operation: "handleRetriesExhausted" }),
       );
     });
 
     // Wait for initial sync
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(new Error("Folder sync timed out after 30 seconds"));
+        const provider = this.provider!;
+        const connState = provider.connectionState;
+        const receivedMessages = provider.wsLastMessageReceived > 0;
+        // Redact the token from the URL for safe logging
+        const safeUrl = provider.url.replace(/token=[^&]+/, "token=***");
+        const details = [
+          `status=${connState.status}`,
+          `wsConnected=${provider.wsconnected}`,
+          `wsConnecting=${provider.wsconnecting}`,
+          `messagesReceived=${receivedMessages}`,
+          `unsuccessfulReconnects=${provider.wsUnsuccessfulReconnects}`,
+          `url=${safeUrl}`,
+        ].join(", ");
+        const message = `Folder sync timed out after 30 seconds (${details})`;
+        reject(new Error(message));
       }, 30_000);
 
       this.provider!.once("synced", () => {
@@ -101,7 +116,7 @@ export class FolderSync {
         logger.info("Folder connection recovered with fresh token");
       }
     } catch (err) {
-      logger.error("Failed to get fresh token for folder recovery", err);
+      captureError(err, { component: "FolderSync", operation: "getFreshTokenForRecovery" });
     }
   }
 
@@ -123,7 +138,7 @@ export class FolderSync {
    */
   observeMetaChanges(handlers: {
     onFileAdded: (vpath: string, meta: Meta) => void;
-    onFileDeleted: (vpath: string) => void;
+    onFileDeleted: (vpath: string, meta: Meta) => void;
     onFileUpdated: (vpath: string, meta: Meta) => void;
   }): void {
     // Unobserve any existing observer before setting a new one
@@ -142,7 +157,7 @@ export class FolderSync {
             handlers.onFileAdded(vpath, this.filemeta.get(vpath)!);
             break;
           case "delete":
-            handlers.onFileDeleted(vpath);
+            handlers.onFileDeleted(vpath, change.oldValue as Meta);
             break;
           case "update":
             handlers.onFileUpdated(vpath, this.filemeta.get(vpath)!);

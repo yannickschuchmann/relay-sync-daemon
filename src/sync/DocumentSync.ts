@@ -5,6 +5,7 @@ import type { Config } from "../config";
 import { type DocumentMeta, SyncType } from "../protocol/types";
 import { documentS3RN, canvasS3RN } from "../util/s3rn";
 import { logger } from "../util/logger";
+import { captureError } from "../reporting";
 
 /**
  * Manages a single document's Y.Doc connection.
@@ -75,7 +76,7 @@ export class DocumentSync {
     // Handle exhausted retries: get fresh token and reconnect
     this.provider.on("retries-exhausted", () => {
       this.handleRetriesExhausted().catch((err) =>
-        logger.error(`Failed to recover document connection for ${this.vpath} after retries exhausted`, err),
+        captureError(err, { component: "DocumentSync", operation: "handleRetriesExhausted", vpath: this.vpath }),
       );
     });
 
@@ -115,7 +116,7 @@ export class DocumentSync {
         logger.info(`Document connection recovered for ${this.vpath}`);
       }
     } catch (err) {
-      logger.error(`Failed to get fresh token for ${this.vpath}`, err);
+      captureError(err, { component: "DocumentSync", operation: "getFreshToken", vpath: this.vpath });
     }
   }
 
